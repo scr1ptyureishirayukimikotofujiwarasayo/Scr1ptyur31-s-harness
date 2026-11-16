@@ -9,9 +9,15 @@ No API keys required:
 
 `web_fetch` pulls a page and converts HTML to readable text for the model.
 
+A headless browser (Chromium-family) is used automatically for public hosts
+when one is installed: it renders JavaScript and passes bot checks better than
+urllib. It runs invisibly (no window) and falls back to urllib when no browser
+is found. Loopback URLs (tests, local servers) always use urllib.
+
 Overrides (also used by tests):
     SEARXNG_URL       SearXNG base URL (e.g. http://localhost:8080)
     DUCKDUCKGO_URL    alternate HTML endpoint
+    AGENT_BROWSER     headless browser binary path, or "off" to disable
 """
 
 from __future__ import annotations
@@ -19,6 +25,9 @@ from __future__ import annotations
 import html
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,10 +50,210 @@ USER_AGENT = (
 DDG_SEARCH_URL = "https://html.duckduckgo.com/html/"
 DDG_LITE_URL = "https://lite.duckduckgo.com/lite/"
 SEARXNG_TIMEOUT = 15
+BROWSER_TIMEOUT = 25
+
+# Env override for the headless browser binary. Set to a path to force a
+# specific browser, or to "off" (0/false/no) to disable the browser and use
+# the plain urllib client everywhere.
+BROWSER_ENV = "AGENT_BROWSER"
 
 
 class WebSearchError(RuntimeError):
     """Raised when search/fetch fails with an actionable message."""
+
+
+# ---------------------------------------------------------------------------
+# Headless browser (optional, zero dependencies)
+#
+# A real browser renders pages (including JavaScript) and passes basic bot
+# checks far more reliably than a bare urllib request. When a Chromium-family
+# binary is found, `web_search` (DuckDuckGo) and `web_fetch` use it headlessly:
+# no window is ever shown to the user, and the whole thing runs invisibly in
+# the background. Everything falls back to the urllib client when no browser
+# is available, when AGENT_BROWSER is "off", or for loopback URLs (tests and
+# local SearXNG instances stay fast and deterministic on urllib).
+# ---------------------------------------------------------------------------
+
+_BROWSER_BINARY: str | None = None
+_BROWSER_RESOLVED = False
+
+
+def _browser_disabled() -> bool:
+    return os.environ.get(BROWSER_ENV, "").strip().lower() in (
+        "0", "off", "false", "no", "none",
+    )
+
+
+def find_browser() -> str | None:
+    """Locate a headless-capable Chromium-family binary, or None.
+
+    Resolution order: AGENT_BROWSER override, binaries on PATH, known
+    install locations (Edge/Chrome/Chromium on Windows, macOS, Linux),
+    then the Playwright browser cache. The result is cached for the process.
+    """
+    global _BROWSER_BINARY, _BROWSER_RESOLVED
+    if _BROWSER_RESOLVED:
+        return _BROWSER_BINARY
+    _BROWSER_RESOLVED = True
+    _BROWSER_BINARY = _find_browser_uncached()
+    return _BROWSER_BINARY
+
+
+def _find_browser_uncached() -> str | None:
+    override = os.environ.get(BROWSER_ENV, "").strip()
+    if override and not _browser_disabled():
+        found = override if os.path.isfile(override) else shutil.which(override)
+        return found or None
+
+    for name in (
+        "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+        "chrome", "msedge", "microsoft-edge", "chrome-headless-shell",
+    ):
+        found = shutil.which(name)
+        if found:
+            return found
+
+    candidates: list[str] = []
+    if os.name == "nt":
+        for base in (
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+            os.environ.get("ProgramW6432"),
+            os.environ.get("LOCALAPPDATA"),
+        ):
+            if not base:
+                continue
+            candidates.extend(
+                [
+                    os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"),
+                    os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"),
+                    os.path.join(base, "Chromium", "Application", "chrome.exe"),
+                ]
+            )
+    else:
+        candidates.extend(
+            [
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+                "/snap/bin/chromium",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            ]
+        )
+
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+
+    return _find_in_playwright_cache()
+
+
+def _find_in_playwright_cache() -> str | None:
+    """Search the Playwright ms-playwright cache for chromium binaries."""
+    wanted_full = {"chrome", "chrome.exe", "chromium", "chromium.exe"}
+    wanted_shell = {"headless_shell", "headless_shell.exe",
+                    "chrome-headless-shell", "chrome-headless-shell.exe"}
+    roots = [
+        os.environ.get("LOCALAPPDATA"),
+        os.path.expanduser("~/.cache"),
+        os.environ.get("XDG_CACHE_HOME"),
+    ]
+    for root in roots:
+        if not root:
+            continue
+        ms = os.path.join(root, "ms-playwright")
+        if not os.path.isdir(ms):
+            continue
+        full: list[str] = []
+        shells: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(ms):
+            if dirpath[len(ms):].count(os.sep) > 3:
+                dirnames[:] = []
+                continue
+            for filename in filenames:
+                if filename.lower() in wanted_full:
+                    full.append(os.path.join(dirpath, filename))
+                elif filename.lower() in wanted_shell:
+                    shells.append(os.path.join(dirpath, filename))
+        for path in full + shells:
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def _should_use_browser(url: str) -> bool:
+    """True when the browser should be used for this URL.
+
+    Loopback hosts are excluded so tests and local SearXNG/other local
+    servers keep using the fast, deterministic urllib client.
+    """
+    if _browser_disabled():
+        return False
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return False
+    return find_browser() is not None
+
+
+def _browser_fetch_html(url: str, timeout: int = BROWSER_TIMEOUT) -> str:
+    """Fetch `url` with a headless browser and return the rendered HTML.
+
+    Runs invisibly (no window, CREATE_NO_WINDOW on Windows) and returns ""
+    on any failure so callers can fall back to urllib.
+    """
+    binary = find_browser()
+    if not binary:
+        return ""
+    budget_ms = max(1, min(int(timeout), 45)) * 1000
+    flags = [
+        "--headless",
+        "--disable-gpu",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--mute-audio",
+        "--dump-dom",
+        f"--virtual-time-budget={budget_ms}",
+    ]
+    kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    env = dict(os.environ)
+    try:
+        with tempfile.TemporaryDirectory(prefix="agent-browser-") as profile:
+            argv = [binary, *flags, f"--user-data-dir={profile}", url]
+            completed = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=max(15, int(timeout) + 15),
+                env=env,
+                **kwargs,
+            )
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout or ""
+
+
+def _ddg_blocked(markup: str) -> bool:
+    lowered = (markup or "").lower()
+    return any(
+        marker in lowered
+        for marker in ("unusual traffic", "anomaly.js", "error-lite", "if this persists")
+    )
 
 
 def web_search(
@@ -101,6 +310,19 @@ def web_fetch(url: str, max_chars: int = 8_000, timeout: int = 20) -> str:
         raise WebSearchError("url must not be empty")
     if not url.lower().startswith(("http://", "https://")):
         raise WebSearchError("url must start with http:// or https://")
+
+    # Prefer the headless browser for real hosts: it renders JavaScript and
+    # avoids most bot blocks. Loopback (tests, local servers) stays on urllib.
+    if _should_use_browser(url):
+        rendered = _browser_fetch_html(url, timeout)
+        if rendered:
+            title, body = _html_to_text(rendered)
+            limit = max(500, min(40_000, int(max_chars)))
+            header = f"Fetched: {url}"
+            if title.strip():
+                header += f"\nTitle: {' '.join(title.split())}"
+            body = body.strip() or "(no readable text)"
+            return truncate(f"{header}\n\n{body}", limit + len(header) + 8)
 
     request = urllib.request.Request(
         url,
@@ -222,12 +444,22 @@ def _search_duckduckgo(query: str, limit: int) -> list[dict[str, str]]:
     if last_error is not None:
         raise last_error
     raise WebSearchError(
-        "DuckDuckGo returned no parseable results; configure SearXNG via searxng_url"
+        "DuckDuckGo returned no parseable results (rate limit or bot check). "
+        "Retry in a moment, or set searxng_url to a SearXNG instance for reliable search."
     )
 
 
 def _fetch_ddg(query: str, base: str) -> str:
     url = base + ("&" if "?" in base else "?") + urllib.parse.urlencode({"q": query})
+
+    # Prefer the headless browser for the real DuckDuckGo endpoints: it passes
+    # the bot check much more often than a bare urllib request. If it returns a
+    # clean page, use it; otherwise fall through to urllib below.
+    if _should_use_browser(url):
+        markup = _browser_fetch_html(url, SEARXNG_TIMEOUT)
+        if markup and not _ddg_blocked(markup):
+            return markup
+
     request = urllib.request.Request(
         url,
         headers={
@@ -244,17 +476,17 @@ def _fetch_ddg(query: str, base: str) -> str:
     except urllib.error.HTTPError as exc:
         if exc.code in (202, 403, 429):
             raise WebSearchError(
-                "DuckDuckGo blocked the request (rate limit / bot check); "
-                "configure SearXNG with searxng_url for reliable search"
+                "DuckDuckGo blocked the request (rate limit / bot check). "
+                "Retry in a moment, or set searxng_url to a SearXNG instance for reliable search."
             ) from exc
         raise WebSearchError(f"DuckDuckGo answered HTTP {exc.code}") from exc
     except (urllib.error.URLError, TimeoutError) as exc:
         raise WebSearchError(f"cannot reach DuckDuckGo: {exc}") from exc
 
-    lowered = raw.lower()
-    if status == 202 or "unusual traffic" in lowered or "anomaly.js" in lowered:
+    if status == 202 or _ddg_blocked(raw):
         raise WebSearchError(
-            "DuckDuckGo returned a bot challenge; configure SearXNG via searxng_url"
+            "DuckDuckGo returned a bot challenge. Retry in a moment, "
+            "or set searxng_url to a SearXNG instance for reliable search."
         )
     return raw
 
