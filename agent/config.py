@@ -32,7 +32,7 @@ DEFAULT_PROVIDERS: dict[str, dict[str, Any]] = {
         "api_key_env": ["OPENROUTER_API_KEY"],
         "default_model": "anthropic/claude-sonnet-4.5",
         "headers": {
-            "HTTP-Referer": "https://github.com/local/python-ai-agent",
+            "HTTP-Referer": "https://github.com/scr1ptyureishirayukimikotofujiwarasayo/Scr1ptyur31-s-harness",
             "X-Title": "Python AI Agent",
         },
     },
