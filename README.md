@@ -38,7 +38,6 @@ python ai agent/
   examples/plugins/     # clock.py: template plugin, not auto-loaded
   tests/fixtures/       # test plugin used by the smoke suite
   clean.bat / clean.sh  # wipe keys, sessions, caches before sharing
-  LICENSE               # MIT (put your name in it)
   SECURITY.md           # how to report issues / keep keys out of git
   .github/workflows/    # CI: offline smoke tests on Linux/Windows/macOS
   AGENTS.md             # optional project instructions for the agent
@@ -53,7 +52,7 @@ python ai agent/
 
 ```bat
 :: from a clone, or wherever you unpacked the folder
-cd path\to\python-ai-agent
+cd path\to\Scr1ptyur31-s-harness
 notepad .env                 :: paste a key, e.g. OPENROUTER_API_KEY=sk-or-...
 python run.py
 ```
@@ -733,6 +732,13 @@ docker run -d --name searxng -p 8080:8080 searxng/searxng
 - `web_search` and `web_fetch` are marked read-only, so they work in **plan
   mode**; they are the only network tools allowed there (besides GET/HEAD
   `http_request`).
+- **Headless browser.** For public hosts, `web_search` (DuckDuckGo) and
+  `web_fetch` automatically use an installed Chromium-family browser headlessly
+  — no window is ever shown, everything runs invisibly in the background. It
+  renders JavaScript and passes bot checks far better than a bare HTTP client.
+  Auto-detected from Edge / Chrome / Chromium / the Playwright cache; force one
+  with `AGENT_BROWSER=<path>`, or `AGENT_BROWSER=off` to disable. Loopback URLs
+  (tests, local SearXNG) and no-browser setups fall back to the plain client.
 - DuckDuckGo tries the full HTML endpoint first, then its Lite layout, both with
   a browser User-Agent. It is free but can rate-limit or bot-challenge (HTTP
   202); for regular use point `searxng_url` at your own instance.
@@ -1228,7 +1234,7 @@ git init -b main
 git add .
 git status                  # verify: no .env, no .cache, no sessions/*.json
 git commit -m "Initial commit: Python AI agent harness"
-git remote add origin https://github.com/<you>/python-ai-agent.git
+git remote add origin https://github.com/scr1ptyureishirayukimikotofujiwarasayo/Scr1ptyur31-s-harness.git
 git push -u origin main
 ```
 
@@ -1240,7 +1246,6 @@ Checklist (all verified for this tree):
 - [x] no `ghp_…` / `sk-…` / private-key strings anywhere in the tree
 - [x] no absolute personal paths in code or docs
 - [x] `.gitattributes` keeps `.bat` CRLF and everything else LF
-- [x] `LICENSE` (MIT — replace `<Your Name>`), `SECURITY.md`
 - [x] CI in `.github/workflows/tests.yml`: offline smoke tests on Linux, Windows
       and macOS (Python 3.10 + 3.12) plus the pty palette/picker test on Ubuntu
 - [x] `python tests/smoke_test.py` runs with no API key and no network
